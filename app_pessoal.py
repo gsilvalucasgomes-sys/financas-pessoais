@@ -2,6 +2,21 @@ import sqlite3
 from datetime import date
 import pandas as pd
 import streamlit as st
+# --- Helpers PT-BR (mês) ---
+MESES_PT = [
+    "Janeiro","Fevereiro","Março","Abril","Maio","Junho",
+    "Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"
+]
+
+def mes_label_pt(ano: int, mes: int) -> str:
+    return f"{MESES_PT[mes-1]}/{ano}"
+
+def parse_mes_key(key: str) -> tuple[int, int]:
+    # key no formato "YYYY-MM"
+    a, m = key.split("-")
+    return int(a), int(m)
+
+
 
 DB = "finance_pessoal.db"
 
