@@ -11,13 +11,6 @@ st.set_page_config(page_title="Finanças Pessoais", page_icon="💳", layout="wi
 # =========================
 # Helpers
 # =========================
-def key(prefix: str) -> str:
-    if "_key_seq" not in st.session_state:
-        st.session_state._key_seq = 0
-    st.session_state._key_seq += 1
-    return f"{prefix}_{st.session_state._key_seq}"
-
-
 def to_dt(s):
     return pd.to_datetime(s, errors="coerce")
 
@@ -52,7 +45,6 @@ def compute_statement_month(purchase_date: date, closing_day: int) -> str:
 
 
 def months_between(d1: date, d2: date) -> int:
-    """Número de meses (incluindo o mês inicial) entre duas datas."""
     return (d2.year - d1.year) * 12 + (d2.month - d1.month) + 1
 
 
@@ -65,7 +57,6 @@ def require_login():
     if "auth_ok" not in st.session_state:
         st.session_state.auth_ok = False
 
-    # Sem secret: não trava (útil em dev), mas avisa
     if not pw_secret:
         st.warning("⚠️ APP_PASSWORD não configurado nos Secrets. O app ficará sem login.")
         return
@@ -93,7 +84,6 @@ def require_login():
 
 require_login()
 
-# Top bar
 top_left, top_right = st.columns([6, 2])
 with top_right:
     mobile_mode = st.toggle("📱 Modo celular", value=False, key="mobile_mode")
@@ -116,7 +106,6 @@ def table_columns(con, table):
 
 def ensure_schema():
     with conectar() as con:
-        # Contas
         con.execute("""
         CREATE TABLE IF NOT EXISTS accounts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,7 +115,6 @@ def ensure_schema():
         );
         """)
 
-        # Cartões
         con.execute("""
         CREATE TABLE IF NOT EXISTS cards (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,7 +129,6 @@ def ensure_schema():
         if "last4" not in cols_cards:
             con.execute("ALTER TABLE cards ADD COLUMN last4 TEXT;")
 
-        # Metas mensais (mantida)
         con.execute("""
         CREATE TABLE IF NOT EXISTS goals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -150,7 +137,6 @@ def ensure_schema():
         );
         """)
 
-        # Lançamentos
         con.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -176,7 +162,6 @@ def ensure_schema():
         if "recurrence_id" not in cols_tx:
             con.execute("ALTER TABLE transactions ADD COLUMN recurrence_id INTEGER;")
 
-        # Recorrências
         con.execute("""
         CREATE TABLE IF NOT EXISTS recurrences (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -193,7 +178,6 @@ def ensure_schema():
         );
         """)
 
-        # Meta por prazo (ex: 1 ano)
         con.execute("""
         CREATE TABLE IF NOT EXISTS long_goals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -206,12 +190,26 @@ def ensure_schema():
         );
         """)
 
-        # Regras de categorias (Essencial vs Discricionário)
         con.execute("""
         CREATE TABLE IF NOT EXISTS category_rules (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             category TEXT NOT NULL UNIQUE,
             class TEXT NOT NULL CHECK(class IN ('ESSENTIAL','DISCRETIONARY'))
+        );
+        """)
+
+        # Transferências
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS transfers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dt TEXT NOT NULL,
+            amount REAL NOT NULL,
+            from_account_id INTEGER NOT NULL,
+            to_account_id INTEGER NOT NULL,
+            description TEXT,
+            status TEXT NOT NULL CHECK(status IN ('PENDING','PAID')) DEFAULT 'PAID',
+            FOREIGN KEY(from_account_id) REFERENCES accounts(id),
+            FOREIGN KEY(to_account_id) REFERENCES accounts(id)
         );
         """)
 
@@ -230,12 +228,24 @@ def seed_if_empty():
             con.execute("INSERT INTO accounts (name,type,initial_balance) VALUES (?,?,?)", ("Carteira", "CASH", 0))
             con.commit()
 
+    # cria "Reserva/Investimentos" se não existir
+    with conectar() as con:
+        exists = con.execute(
+            "SELECT COUNT(*) FROM accounts WHERE LOWER(name)=LOWER(?)",
+            ("Reserva/Investimentos",)
+        ).fetchone()[0]
+        if exists == 0:
+            con.execute(
+                "INSERT INTO accounts (name,type,initial_balance) VALUES (?,?,?)",
+                ("Reserva/Investimentos", "BANK", 0)
+            )
+        con.commit()
+
     if g == 0:
         with conectar() as con:
             con.execute("INSERT INTO goals (name, monthly_target) VALUES (?,?)", ("Economia do mês", 0))
             con.commit()
 
-    # Categorias padrão: Discricionários (neutro, sem julgamento)
     if c == 0:
         default_discretionary = ["delivery", "bar", "compras", "streamings", "jogos"]
         with conectar() as con:
@@ -294,6 +304,15 @@ def carregar_transactions():
     return df
 
 
+def carregar_transfers():
+    with conectar() as con:
+        df = pd.read_sql_query("SELECT * FROM transfers ORDER BY dt DESC, id DESC", con)
+    df["dt"] = to_dt(df["dt"]).dt.date
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+    df["description"] = df["description"].fillna("")
+    return df
+
+
 # =========================
 # Core functions
 # =========================
@@ -330,6 +349,31 @@ def delete_transaction(tx_id: int):
         con.commit()
 
 
+def add_transfer(dt_: date, amount: float, from_account_id: int, to_account_id: int, description: str, status: str):
+    with conectar() as con:
+        con.execute("""
+            INSERT INTO transfers (dt, amount, from_account_id, to_account_id, description, status)
+            VALUES (?,?,?,?,?,?)
+        """, (dt_.isoformat(), float(amount), int(from_account_id), int(to_account_id), description or None, status))
+        con.commit()
+
+
+def delete_transfer(transfer_id: int):
+    with conectar() as con:
+        con.execute("DELETE FROM transfers WHERE id=?", (int(transfer_id),))
+        con.commit()
+
+
+def atualizar_cartao(card_id: int, name: str, closing_day: int, due_day: int, pay_account_id: int, last4: str):
+    with conectar() as con:
+        con.execute("""
+            UPDATE cards
+            SET name=?, closing_day=?, due_day=?, pay_account_id=?, last4=?
+            WHERE id=?
+        """, (name.strip(), int(closing_day), int(due_day), int(pay_account_id), (last4 or "").strip(), int(card_id)))
+        con.commit()
+
+
 def calc_account_balance(account_id: int, tx: pd.DataFrame, accounts: pd.DataFrame) -> float:
     init = float(accounts.loc[accounts["id"] == account_id, "initial_balance"].iloc[0])
     df = tx[tx["status"] == "PAID"].copy()
@@ -341,12 +385,16 @@ def calc_account_balance(account_id: int, tx: pd.DataFrame, accounts: pd.DataFra
     df_pay = df[(df["method"] == "CARD_PAYMENT") & (df["account_id"] == account_id)]
     pay_out = df_pay["amount"].sum()
 
-    return init + float(incomes) - float(expenses) - float(pay_out)
+    tr = carregar_transfers()
+    tr_paid = tr[tr["status"] == "PAID"]
+    out_tr = tr_paid[tr_paid["from_account_id"] == account_id]["amount"].sum()
+    in_tr = tr_paid[tr_paid["to_account_id"] == account_id]["amount"].sum()
+
+    return init + float(incomes) - float(expenses) - float(pay_out) - float(out_tr) + float(in_tr)
 
 
 def card_statement_detail(card_id: int, statement_month: str, tx: pd.DataFrame) -> pd.DataFrame:
-    df = tx[(tx["method"] == "CARD") & (tx["card_id"] == card_id) & (tx["statement_month"] == statement_month)].copy()
-    return df
+    return tx[(tx["method"] == "CARD") & (tx["card_id"] == card_id) & (tx["statement_month"] == statement_month)].copy()
 
 
 def card_statement_total(card_id: int, statement_month: str, tx: pd.DataFrame) -> float:
@@ -371,7 +419,6 @@ def create_installments_on_card(dt_: date, total_amount: float, n: int, category
             description=f"{description} ({i}/{n})",
             status=status,
             method="CARD",
-            account_id=None,
             card_id=card_id,
             statement_month=stmt,
             installments_total=n,
@@ -424,7 +471,7 @@ def run_recurrences_for_month(target_ym: str):
 
 
 # =========================
-# Meta por prazo (1 ano etc.)
+# Long goal + category rules
 # =========================
 def salvar_long_goal(name: str, target_amount: float, start_date: date, end_date: date, start_amount: float):
     with conectar() as con:
@@ -443,7 +490,6 @@ def calc_long_goal_plan(goal_row: dict, tx: pd.DataFrame) -> dict:
     start_amount = float(goal_row["start_amount"])
 
     total_months = max(1, months_between(start_date, end_date))
-
     period = tx[(tx["dt"] >= start_date) & (tx["dt"] <= end_date) & (tx["status"] == "PAID")].copy()
 
     income = float(period[period["kind"] == "INCOME"]["amount"].sum())
@@ -454,7 +500,6 @@ def calc_long_goal_plan(goal_row: dict, tx: pd.DataFrame) -> dict:
     current_amount = start_amount + saved_so_far
     remaining = max(0.0, target_amount - current_amount)
     need_per_month = remaining / total_months if total_months else remaining
-
     progress = 0.0 if target_amount <= 0 else min(1.0, max(0.0, current_amount / target_amount))
 
     return {
@@ -502,7 +547,7 @@ goals = carregar_goals()
 tx = carregar_transactions()
 
 st.title("💳 Finanças Pessoais")
-st.caption("Contas, cartão de crédito, metas, recorrências, parcelamentos e relatórios.")
+st.caption("Contas, cartão de crédito, metas, recorrências, parcelamentos, transferências e relatórios.")
 
 tabs = st.tabs([
     "🏠 Dashboard",
@@ -521,9 +566,14 @@ tabs = st.tabs([
 # =========================
 with tabs[0]:
     hoje = date.today()
+
+    # inclui meses de fatura também
     all_months = sorted(
-        {d.strftime("%Y-%m") for d in pd.to_datetime(tx["dt"], errors="coerce").dropna()} | {hoje.strftime("%Y-%m")}
+        {d.strftime("%Y-%m") for d in pd.to_datetime(tx["dt"], errors="coerce").dropna()}
+        | set(tx.loc[(tx["method"] == "CARD") & (tx["statement_month"] != ""), "statement_month"].astype(str).tolist())
+        | {hoje.strftime("%Y-%m")}
     )
+
     ym = st.selectbox(
         "Mês",
         options=all_months,
@@ -566,15 +616,15 @@ with tabs[0]:
         st.bar_chart(cat)
 
     st.subheader("Saldos das contas (pagos)")
+    accounts = carregar_accounts()
+    tx = carregar_transactions()
     bal_rows = [{"Conta": a["name"], "Tipo": a["type"], "Saldo": calc_account_balance(int(a["id"]), tx, accounts)}
                 for _, a in accounts.iterrows()]
     st.dataframe(pd.DataFrame(bal_rows), use_container_width=True, hide_index=True)
 
     st.divider()
 
-    # -------- Cards de cartões + alertas por % da renda --------
     st.subheader("💳 Cartões – fatura do mês")
-
     WARN_PCT = 20.0
     HIGH_PCT = 30.0
     income_month = float(month_paid[month_paid["kind"] == "INCOME"]["amount"].sum())
@@ -583,6 +633,8 @@ with tabs[0]:
         st.warning("⚠️ Sem renda (entradas pagas) registrada neste mês. Os alertas por % ficarão desativados.")
 
     cards = carregar_cards()
+    tx = carregar_transactions()
+
     if cards.empty:
         st.info("Cadastre cartões para ver os valores aqui.")
     else:
@@ -626,9 +678,7 @@ with tabs[0]:
                     unsafe_allow_html=True
                 )
 
-        # -------- Insights Top 3 --------
         st.markdown("### 🧠 Insights do mês (cartões)")
-
         rows = []
         for row in cards.itertuples(index=False):
             total = float(card_statement_total(row.id, ym, tx))
@@ -655,7 +705,6 @@ with tabs[0]:
             })
 
         df_cards = pd.DataFrame(rows).sort_values("total", ascending=False)
-
         if df_cards["total"].sum() <= 0:
             st.info("Sem gastos em cartão neste mês.")
         else:
@@ -676,7 +725,6 @@ with tabs[0]:
 
             with c2:
                 st.subheader("O que ajustar para voltar pro caminho certo")
-
                 if income_month <= 0:
                     st.warning("Sem renda no mês: não dá para calcular alertas por %. Lance uma entrada (ex: Salário).")
                 else:
@@ -707,11 +755,9 @@ with tabs[0]:
                                     f"→ reduzir **R$ {r['reduce_to_warn']:,.2f}** para ficar < 20%."
                                 )
 
-                    st.caption("💡 'Reduzir' aqui = evitar novas compras no cartão neste mês (ou usar conta/dinheiro).")
-
 
 # =========================
-# Lançamentos
+# Lançamentos + Transferências
 # =========================
 with tabs[1]:
     st.subheader("Adicionar lançamento")
@@ -751,18 +797,10 @@ with tabs[1]:
         with col3:
             description = st.text_input("Descrição", placeholder="Opcional", key="tx_desc")
 
-    # Dica de classificação
-    cat_class = None
+    # classificação
     if (category or "").strip():
         if is_discretionary(category, rules):
-            cat_class = "DISCRETIONARY"
             st.info("🏷️ Categoria classificada como **Discricionária** (pode gerar alerta na meta por prazo).")
-        else:
-            # se existir como ESSENTIAL mostra, se não, neutro
-            hit = rules[rules["category"].str.lower() == category.strip().lower()]
-            if not hit.empty and hit.iloc[0]["class"] == "ESSENTIAL":
-                cat_class = "ESSENTIAL"
-                st.success("🏷️ Categoria classificada como **Essencial** (não gera alerta).")
 
     account_id = None
     card_id = None
@@ -794,51 +832,106 @@ with tabs[1]:
             statement_month = compute_statement_month(dt_, closing_day)
             st.caption(f"📌 Vai para a fatura: **{statement_month}** (fechamento dia {closing_day})")
 
-    # Alertas da meta por prazo (só para gastos discricionários)
+    # alerta da meta por prazo
     lg = carregar_long_goal()
-    will_warn = False
-    warn_msg = ""
+    if kind == "EXPENSE" and status == "PAID" and (category or "").strip() and not lg.empty and is_discretionary(category, rules):
+        goal_row = lg.iloc[0].to_dict()
+        plan = calc_long_goal_plan(goal_row, tx)
+        required_per_month = float(plan["need_per_month"])
+        ym_tx = dt_.strftime("%Y-%m")
+        current_save = current_month_savings(tx, ym_tx)
 
-    if kind == "EXPENSE" and status == "PAID" and (category or "").strip() and not lg.empty:
-        if is_discretionary(category, rules):
-            goal_row = lg.iloc[0].to_dict()
-            plan = calc_long_goal_plan(goal_row, tx)
-
-            # Quanto deveria poupar por mês (média)
-            required_per_month = float(plan["need_per_month"])
-
-            # economia do mês atual (com base no mês do lançamento)
-            ym_tx = dt_.strftime("%Y-%m")
-            current_save = current_month_savings(tx, ym_tx)
-
-            # Se já está abaixo do necessário, qualquer gasto discricionário “piora”
-            if required_per_month > 0 and current_save < required_per_month:
-                gap = required_per_month - current_save
-                will_warn = True
-                warn_msg = (
-                    f"⚠️ Este gasto é **discricionário** e você está **abaixo do necessário** para a meta por prazo.\n\n"
-                    f"- Meta por prazo: **{goal_row['name']}**\n"
-                    f"- Necessário por mês (média): **R$ {required_per_month:,.2f}**\n"
-                    f"- Você está economizando neste mês (estimado): **R$ {current_save:,.2f}**\n"
-                    f"- Falta para bater a média: **R$ {gap:,.2f}**\n\n"
-                    f"💡 Sugestão: evite novos discricionários ou compense economizando **+R$ {float(amount):,.2f}** até o fim do mês."
-                )
-
-    if will_warn:
-        st.warning(warn_msg)
+        if required_per_month > 0 and current_save < required_per_month:
+            gap = required_per_month - current_save
+            st.warning(
+                f"⚠️ Gasto **discricionário** e você está abaixo do necessário para a meta.\n\n"
+                f"- Meta: **{goal_row['name']}**\n"
+                f"- Necessário/mês (média): **R$ {required_per_month:,.2f}**\n"
+                f"- Economia do mês (estimada): **R$ {current_save:,.2f}**\n"
+                f"- Falta para bater a média: **R$ {gap:,.2f}**\n\n"
+                f"💡 Sugestão: compense economizando **+R$ {float(amount):,.2f}** até o fim do mês."
+            )
 
     if st.button("Salvar lançamento ✅", use_container_width=True, key="tx_save_btn"):
         if method == "CARD" and installments_total and int(installments_total) > 1:
             create_installments_on_card(dt_, amount, int(installments_total), category, description, int(card_id), int(closing_day), status)
         else:
             add_transaction(dt_, kind, amount, category, description, status, method, account_id, card_id, statement_month)
-
         st.success("Lançamento salvo!")
         st.rerun()
 
     st.divider()
-    st.subheader("Últimos lançamentos")
+    st.subheader("🔁 Transferência (Conta → Conta)")
+    st.caption("Transferência não conta como despesa. Use para mover dinheiro para Reserva/Investimentos, poupança, etc.")
 
+    accounts = carregar_accounts()
+    tr = carregar_transfers()
+
+    if accounts.empty or len(accounts) < 2:
+        st.warning("Você precisa de pelo menos 2 contas cadastradas para transferir.")
+    else:
+        if mobile_mode:
+            tr_date = st.date_input("Data", value=date.today(), key="tr_date")
+            tr_status = st.selectbox("Status", ["PAID", "PENDING"],
+                                     format_func=lambda x: "Pago" if x == "PAID" else "Pendente",
+                                     key="tr_status")
+            tr_amount = st.number_input("Valor", min_value=0.0, step=50.0, key="tr_amount")
+        else:
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                tr_date = st.date_input("Data", value=date.today(), key="tr_date")
+            with c2:
+                tr_status = st.selectbox("Status", ["PAID", "PENDING"],
+                                         format_func=lambda x: "Pago" if x == "PAID" else "Pendente",
+                                         key="tr_status")
+            with c3:
+                tr_amount = st.number_input("Valor", min_value=0.0, step=50.0, key="tr_amount")
+
+        ids = accounts["id"].tolist()
+        names = {int(r["id"]): r["name"] for _, r in accounts.iterrows()}
+
+        if mobile_mode:
+            from_id = st.selectbox("De (origem)", ids, format_func=lambda i: names[int(i)], key="tr_from")
+            to_id = st.selectbox("Para (destino)", ids, format_func=lambda i: names[int(i)], key="tr_to")
+            tr_desc = st.text_input("Descrição", placeholder="Ex: aporte do mês", key="tr_desc")
+        else:
+            c4, c5 = st.columns(2)
+            with c4:
+                from_id = st.selectbox("De (origem)", ids, format_func=lambda i: names[int(i)], key="tr_from")
+            with c5:
+                to_id = st.selectbox("Para (destino)", ids, format_func=lambda i: names[int(i)], key="tr_to")
+            tr_desc = st.text_input("Descrição", placeholder="Ex: aporte do mês", key="tr_desc")
+
+        if st.button("Salvar transferência ✅", use_container_width=True, key="tr_save"):
+            if from_id == to_id:
+                st.error("Origem e destino não podem ser a mesma conta.")
+            elif tr_amount <= 0:
+                st.error("Informe um valor maior que zero.")
+            else:
+                add_transfer(tr_date, tr_amount, int(from_id), int(to_id), tr_desc, tr_status)
+                st.success("Transferência registrada!")
+                st.rerun()
+
+        st.markdown("### Últimas transferências")
+        if tr.empty:
+            st.info("Nenhuma transferência registrada ainda.")
+        else:
+            view = tr.copy()
+            view["de"] = view["from_account_id"].map(lambda i: names.get(int(i), "—"))
+            view["para"] = view["to_account_id"].map(lambda i: names.get(int(i), "—"))
+            st.dataframe(view[["id", "dt", "amount", "de", "para", "status", "description"]],
+                         use_container_width=True, hide_index=True)
+
+        with st.expander("🗑️ Excluir transferência"):
+            tr_del_id = st.number_input("ID da transferência", min_value=0, step=1, key="tr_del_id")
+            if st.button("Excluir transferência", type="secondary", key="tr_del_btn"):
+                if tr_del_id > 0:
+                    delete_transfer(int(tr_del_id))
+                    st.success("Transferência excluída.")
+                    st.rerun()
+
+    st.divider()
+    st.subheader("Últimos lançamentos")
     tx = carregar_transactions()
     tx_view = tx.copy()
     tx_view["tipo"] = tx_view["kind"].map({"INCOME": "Entrada", "EXPENSE": "Saída"})
@@ -863,7 +956,7 @@ with tabs[1]:
 
 
 # =========================
-# Cartões
+# Cartões (cadastro + edição + faturas)
 # =========================
 with tabs[2]:
     st.subheader("Cartões de crédito")
@@ -872,18 +965,9 @@ with tabs[2]:
     cards = carregar_cards()
 
     st.markdown("### Cadastrar cartão")
-    if mobile_mode:
-        card_name = st.text_input("Nome do cartão", key="card_name")
-        closing_day = st.number_input("Dia de fechamento (1-28)", min_value=1, max_value=28, value=10, key="card_close")
-        due_day = st.number_input("Dia de vencimento (1-28)", min_value=1, max_value=28, value=15, key="card_due")
-    else:
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            card_name = st.text_input("Nome do cartão", key="card_name")
-        with c2:
-            closing_day = st.number_input("Dia de fechamento (1-28)", min_value=1, max_value=28, value=10, key="card_close")
-        with c3:
-            due_day = st.number_input("Dia de vencimento (1-28)", min_value=1, max_value=28, value=15, key="card_due")
+    card_name = st.text_input("Nome do cartão", key="card_name")
+    closing_day = st.number_input("Dia de fechamento (1-28)", min_value=1, max_value=28, value=10, key="card_close")
+    due_day = st.number_input("Dia de vencimento (1-28)", min_value=1, max_value=28, value=15, key="card_due")
 
     bank_accs = accounts[accounts["type"] == "BANK"]
     pay_acc = None
@@ -912,6 +996,48 @@ with tabs[2]:
             st.rerun()
 
     st.divider()
+    st.markdown("### ✏️ Editar cartão")
+
+    cards = carregar_cards()
+    accounts = carregar_accounts()
+    if cards.empty:
+        st.info("Nenhum cartão cadastrado.")
+    else:
+        card_edit_id = st.selectbox(
+            "Selecione o cartão",
+            cards["id"].tolist(),
+            format_func=lambda i: cards.loc[cards["id"] == i, "name"].iloc[0],
+            key="edit_card_sel"
+        )
+        card_row = cards[cards["id"] == card_edit_id].iloc[0]
+
+        new_name = st.text_input("Nome", value=card_row["name"], key="edit_card_name")
+        new_closing = st.number_input("Fechamento", min_value=1, max_value=28,
+                                      value=int(card_row["closing_day"]), key="edit_card_close")
+        new_due = st.number_input("Vencimento", min_value=1, max_value=28,
+                                  value=int(card_row["due_day"]), key="edit_card_due")
+
+        bank_accs = accounts[accounts["type"] == "BANK"].copy()
+        pay_ids = bank_accs["id"].tolist()
+        current_pay = int(card_row["pay_account_id"]) if pd.notna(card_row["pay_account_id"]) else pay_ids[0]
+        index_pay = pay_ids.index(current_pay) if current_pay in pay_ids else 0
+
+        new_pay_acc = st.selectbox(
+            "Conta para pagar fatura",
+            pay_ids,
+            index=index_pay,
+            format_func=lambda i: bank_accs.loc[bank_accs["id"] == i, "name"].iloc[0],
+            key="edit_card_pay"
+        )
+
+        new_last4 = st.text_input("Final do cartão", value=str(card_row.get("last4", "") or ""), max_chars=4, key="edit_card_last4")
+
+        if st.button("Salvar alterações do cartão 💾", use_container_width=True, key="edit_card_save"):
+            atualizar_cartao(card_edit_id, new_name, new_closing, new_due, int(new_pay_acc), new_last4)
+            st.success("Cartão atualizado com sucesso!")
+            st.rerun()
+
+    st.divider()
     st.markdown("### Faturas")
 
     cards = carregar_cards()
@@ -921,21 +1047,12 @@ with tabs[2]:
     if cards.empty:
         st.info("Cadastre um cartão para ver faturas.")
     else:
-        if mobile_mode:
-            cid = st.selectbox("Cartão", cards["id"].tolist(),
-                               format_func=lambda i: cards.loc[cards["id"] == i, "name"].iloc[0],
-                               key="stmt_card")
-            months = sorted(set(tx[(tx["method"] == "CARD") & (tx["card_id"] == cid)]["statement_month"]) - {""})
-            stmt = st.selectbox("Fatura (YYYY-MM)", months, index=len(months) - 1, key="stmt_month") if months else None
-        else:
-            colA, colB = st.columns(2)
-            with colA:
-                cid = st.selectbox("Cartão", cards["id"].tolist(),
-                                   format_func=lambda i: cards.loc[cards["id"] == i, "name"].iloc[0],
-                                   key="stmt_card")
-            with colB:
-                months = sorted(set(tx[(tx["method"] == "CARD") & (tx["card_id"] == cid)]["statement_month"]) - {""})
-                stmt = st.selectbox("Fatura (YYYY-MM)", months, index=len(months) - 1, key="stmt_month") if months else None
+        cid = st.selectbox("Cartão", cards["id"].tolist(),
+                           format_func=lambda i: cards.loc[cards["id"] == i, "name"].iloc[0],
+                           key="stmt_card")
+
+        months = sorted(set(tx[(tx["method"] == "CARD") & (tx["card_id"] == cid)]["statement_month"]) - {""})
+        stmt = st.selectbox("Fatura (YYYY-MM)", months, index=len(months) - 1, key="stmt_month") if months else None
 
         if stmt:
             total = card_statement_total(cid, stmt, tx)
@@ -972,26 +1089,12 @@ with tabs[3]:
     cards = carregar_cards()
 
     with st.expander("➕ Criar recorrência"):
-        if mobile_mode:
-            r_name = st.text_input("Nome", placeholder="Ex: Aluguel", key="rec_name")
-            r_kind = st.selectbox("Tipo", ["INCOME", "EXPENSE"],
-                                  format_func=lambda x: "Entrada" if x == "INCOME" else "Saída",
-                                  key="rec_kind")
-            r_amount = st.number_input("Valor", min_value=0.0, step=10.0, key="rec_amount")
-            r_day = st.number_input("Dia do mês (1-28)", min_value=1, max_value=28, value=5, key="rec_day")
-        else:
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                r_name = st.text_input("Nome", placeholder="Ex: Aluguel", key="rec_name")
-            with c2:
-                r_kind = st.selectbox("Tipo", ["INCOME", "EXPENSE"],
-                                      format_func=lambda x: "Entrada" if x == "INCOME" else "Saída",
-                                      key="rec_kind")
-            with c3:
-                r_amount = st.number_input("Valor", min_value=0.0, step=10.0, key="rec_amount")
-            with c4:
-                r_day = st.number_input("Dia do mês (1-28)", min_value=1, max_value=28, value=5, key="rec_day")
-
+        r_name = st.text_input("Nome", placeholder="Ex: Aluguel", key="rec_name")
+        r_kind = st.selectbox("Tipo", ["INCOME", "EXPENSE"],
+                              format_func=lambda x: "Entrada" if x == "INCOME" else "Saída",
+                              key="rec_kind")
+        r_amount = st.number_input("Valor", min_value=0.0, step=10.0, key="rec_amount")
+        r_day = st.number_input("Dia do mês (1-28)", min_value=1, max_value=28, value=5, key="rec_day")
         r_method = st.selectbox("Meio", ["BANK", "CASH", "CARD"],
                                 format_func=lambda x: {"BANK": "Conta", "CASH": "Dinheiro", "CARD": "Cartão"}[x],
                                 key="rec_method")
@@ -1084,7 +1187,8 @@ with tabs[4]:
 
         tab = f_exp.groupby(key_series)["amount"].sum().sort_values(ascending=False)
         st.bar_chart(tab)
-        st.dataframe(tab.reset_index().rename(columns={"index": group, "amount": "Total"}), use_container_width=True, hide_index=True)
+        st.dataframe(tab.reset_index().rename(columns={"index": group, "amount": "Total"}),
+                     use_container_width=True, hide_index=True)
 
     st.divider()
     st.subheader("Detalhamento do mês (pagos)")
@@ -1098,22 +1202,11 @@ with tabs[5]:
     st.subheader("🏦 Contas")
 
     st.markdown("### Cadastrar conta")
-    if mobile_mode:
-        acc_name = st.text_input("Nome da conta", key="acc_name")
-        acc_type = st.selectbox("Tipo", ["BANK", "CASH"],
-                                format_func=lambda x: "Conta bancária" if x == "BANK" else "Dinheiro",
-                                key="acc_type")
-        init_bal = st.number_input("Saldo inicial", value=0.0, step=100.0, key="acc_init")
-    else:
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            acc_name = st.text_input("Nome da conta", key="acc_name")
-        with c2:
-            acc_type = st.selectbox("Tipo", ["BANK", "CASH"],
-                                    format_func=lambda x: "Conta bancária" if x == "BANK" else "Dinheiro",
-                                    key="acc_type")
-        with c3:
-            init_bal = st.number_input("Saldo inicial", value=0.0, step=100.0, key="acc_init")
+    acc_name = st.text_input("Nome da conta", key="acc_name")
+    acc_type = st.selectbox("Tipo", ["BANK", "CASH"],
+                            format_func=lambda x: "Conta bancária" if x == "BANK" else "Dinheiro",
+                            key="acc_type")
+    init_bal = st.number_input("Saldo inicial", value=0.0, step=100.0, key="acc_init")
 
     if st.button("Salvar conta", use_container_width=True, key="acc_save"):
         if acc_name.strip():
@@ -1127,7 +1220,7 @@ with tabs[5]:
             st.warning("Informe um nome para a conta.")
 
     st.divider()
-    st.markdown("### Saldos (considerando lançamentos pagos)")
+    st.markdown("### Saldos (pagos)")
 
     accounts = carregar_accounts()
     tx = carregar_transactions()
@@ -1137,12 +1230,11 @@ with tabs[5]:
 
 
 # =========================
-# Metas (mensal + prazo + regras)
+# Metas
 # =========================
 with tabs[6]:
     st.subheader("🎯 Metas")
 
-    # ---- Meta mensal (mantida) ----
     goals = carregar_goals()
     tx = carregar_transactions()
 
@@ -1158,37 +1250,16 @@ with tabs[6]:
         st.rerun()
 
     st.divider()
-
-    # ---- Meta por prazo (ex: 1 ano) ----
     st.subheader("📅 Meta por prazo (ex: 1 ano)")
 
     lg = carregar_long_goal()
-
     with st.expander("➕ Criar/atualizar meta por prazo"):
-        if mobile_mode:
-            g_name = st.text_input("Nome da meta", value="Reserva / Objetivo", key="lg_name")
-            g_target = st.number_input("Valor alvo (R$)", min_value=0.0, step=100.0, key="lg_target")
-            g_start_amount = st.number_input("Já tenho (R$)", min_value=0.0, step=100.0, key="lg_start_amount")
-        else:
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                g_name = st.text_input("Nome da meta", value="Reserva / Objetivo", key="lg_name")
-            with c2:
-                g_target = st.number_input("Valor alvo (R$)", min_value=0.0, step=100.0, key="lg_target")
-            with c3:
-                g_start_amount = st.number_input("Já tenho (R$)", min_value=0.0, step=100.0, key="lg_start_amount")
-
-        if mobile_mode:
-            g_start = st.date_input("Data início", value=date.today(), key="lg_start")
-            default_end = date(date.today().year + 1, date.today().month, 1)
-            g_end = st.date_input("Data fim", value=default_end, key="lg_end")
-        else:
-            c4, c5 = st.columns(2)
-            with c4:
-                g_start = st.date_input("Data início", value=date.today(), key="lg_start")
-            with c5:
-                default_end = date(date.today().year + 1, date.today().month, 1)
-                g_end = st.date_input("Data fim", value=default_end, key="lg_end")
+        g_name = st.text_input("Nome da meta", value="Reserva / Objetivo", key="lg_name")
+        g_target = st.number_input("Valor alvo (R$)", min_value=0.0, step=100.0, key="lg_target")
+        g_start_amount = st.number_input("Já tenho (R$)", min_value=0.0, step=100.0, key="lg_start_amount")
+        g_start = st.date_input("Data início", value=date.today(), key="lg_start")
+        default_end = date(date.today().year + 1, date.today().month, 1)
+        g_end = st.date_input("Data fim", value=default_end, key="lg_end")
 
         if st.button("Salvar meta por prazo ✅", use_container_width=True, key="lg_save"):
             if g_end < g_start:
@@ -1220,14 +1291,10 @@ with tabs[6]:
 
         st.progress(plan["progress"])
         st.caption(f"{plan['progress']*100:.1f}% da meta")
-
         st.info(f"📌 Para bater a meta, você precisa poupar em média **R$ {plan['need_per_month']:,.2f} / mês** daqui pra frente.")
 
     st.divider()
-
-    # ---- Regras de categorias: Essencial vs Discricionário ----
     st.subheader("🏷️ Categorias: Essenciais x Discricionários")
-    st.caption("Padrão já vem com: delivery, bar, compras, streamings, jogos como Discricionários.")
 
     rules = carregar_category_rules()
     st.dataframe(rules, use_container_width=True, hide_index=True)
@@ -1273,42 +1340,22 @@ with tabs[7]:
     cards = carregar_cards()
     rules = carregar_category_rules()
     lg = carregar_long_goal()
+    tr = carregar_transfers()
 
-    if mobile_mode:
-        st.download_button("⬇️ Lançamentos (CSV)", tx.to_csv(index=False).encode("utf-8"),
-                           file_name="lancamentos.csv", mime="text/csv", use_container_width=True, key="dl_tx")
-        st.download_button("⬇️ Recorrências (CSV)", rec.to_csv(index=False).encode("utf-8"),
-                           file_name="recorrencias.csv", mime="text/csv", use_container_width=True, key="dl_rec")
-        st.download_button("⬇️ Contas (CSV)", accounts.to_csv(index=False).encode("utf-8"),
-                           file_name="contas.csv", mime="text/csv", use_container_width=True, key="dl_acc")
-        st.download_button("⬇️ Cartões (CSV)", cards.to_csv(index=False).encode("utf-8"),
-                           file_name="cartoes.csv", mime="text/csv", use_container_width=True, key="dl_cards")
-        st.download_button("⬇️ Categorias (CSV)", rules.to_csv(index=False).encode("utf-8"),
-                           file_name="categorias.csv", mime="text/csv", use_container_width=True, key="dl_rules")
-        st.download_button("⬇️ Meta por prazo (CSV)", lg.to_csv(index=False).encode("utf-8"),
-                           file_name="meta_prazo.csv", mime="text/csv", use_container_width=True, key="dl_lg")
-    else:
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.download_button("⬇️ Lançamentos (CSV)", tx.to_csv(index=False).encode("utf-8"),
-                               file_name="lancamentos.csv", mime="text/csv", use_container_width=True, key="dl_tx")
-        with col2:
-            st.download_button("⬇️ Recorrências (CSV)", rec.to_csv(index=False).encode("utf-8"),
-                               file_name="recorrencias.csv", mime="text/csv", use_container_width=True, key="dl_rec")
-        with col3:
-            st.download_button("⬇️ Contas (CSV)", accounts.to_csv(index=False).encode("utf-8"),
-                               file_name="contas.csv", mime="text/csv", use_container_width=True, key="dl_acc")
-        with col4:
-            st.download_button("⬇️ Cartões (CSV)", cards.to_csv(index=False).encode("utf-8"),
-                               file_name="cartoes.csv", mime="text/csv", use_container_width=True, key="dl_cards")
-
-        col5, col6 = st.columns(2)
-        with col5:
-            st.download_button("⬇️ Categorias (CSV)", rules.to_csv(index=False).encode("utf-8"),
-                               file_name="categorias.csv", mime="text/csv", use_container_width=True, key="dl_rules")
-        with col6:
-            st.download_button("⬇️ Meta por prazo (CSV)", lg.to_csv(index=False).encode("utf-8"),
-                               file_name="meta_prazo.csv", mime="text/csv", use_container_width=True, key="dl_lg")
+    st.download_button("⬇️ Lançamentos (CSV)", tx.to_csv(index=False).encode("utf-8"),
+                       file_name="lancamentos.csv", mime="text/csv", use_container_width=True, key="dl_tx")
+    st.download_button("⬇️ Transferências (CSV)", tr.to_csv(index=False).encode("utf-8"),
+                       file_name="transferencias.csv", mime="text/csv", use_container_width=True, key="dl_tr")
+    st.download_button("⬇️ Recorrências (CSV)", rec.to_csv(index=False).encode("utf-8"),
+                       file_name="recorrencias.csv", mime="text/csv", use_container_width=True, key="dl_rec")
+    st.download_button("⬇️ Contas (CSV)", accounts.to_csv(index=False).encode("utf-8"),
+                       file_name="contas.csv", mime="text/csv", use_container_width=True, key="dl_acc")
+    st.download_button("⬇️ Cartões (CSV)", cards.to_csv(index=False).encode("utf-8"),
+                       file_name="cartoes.csv", mime="text/csv", use_container_width=True, key="dl_cards")
+    st.download_button("⬇️ Categorias (CSV)", rules.to_csv(index=False).encode("utf-8"),
+                       file_name="categorias.csv", mime="text/csv", use_container_width=True, key="dl_rules")
+    st.download_button("⬇️ Meta por prazo (CSV)", lg.to_csv(index=False).encode("utf-8"),
+                       file_name="meta_prazo.csv", mime="text/csv", use_container_width=True, key="dl_lg")
 
     st.divider()
     st.warning("⚠️ No Streamlit Cloud o armazenamento pode resetar em updates. Faça backup com frequência.")
