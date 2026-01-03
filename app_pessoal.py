@@ -48,6 +48,71 @@ def months_between(d1: date, d2: date) -> int:
     return (d2.year - d1.year) * 12 + (d2.month - d1.month) + 1
 
 
+def fmt_currency(v) -> str:
+    try:
+        return f"R$ {float(v):,.2f}"
+    except Exception:
+        return "R$ 0,00"
+
+
+def fmt_date_br(d) -> str:
+    """15/01/2026"""
+    if d is None or pd.isna(d):
+        return "—"
+    if isinstance(d, pd.Timestamp):
+        d = d.date()
+    if isinstance(d, str):
+        d = pd.to_datetime(d, errors="coerce")
+        if pd.isna(d):
+            return "—"
+        d = d.date()
+    return d.strftime("%d/%m/%Y")
+
+
+def fmt_month_br(ym: str) -> str:
+    """2026-02 -> Fevereiro/2026"""
+    if not ym:
+        return "—"
+    d = pd.to_datetime(f"{ym}-01", errors="coerce")
+    if pd.isna(d):
+        return "—"
+    return d.strftime("%B/%Y").capitalize()
+
+
+def fmt_installment(installment_no, installments_total, ym) -> str:
+    """3ª de 6 • Março"""
+    if pd.isna(installment_no) or pd.isna(installments_total):
+        return "—"
+    month = fmt_month_br(ym).split("/")[0]
+    return f"{int(installment_no)}ª de {int(installments_total)} • {month}"
+
+
+def map_accounts(accounts_df: pd.DataFrame) -> dict:
+    return {int(r["id"]): str(r["name"]) for _, r in accounts_df.iterrows()}
+
+
+def map_cards(cards_df: pd.DataFrame) -> dict:
+    mp = {}
+    for _, r in cards_df.iterrows():
+        last4 = (r.get("last4", "") or "----")
+        mp[int(r["id"])] = f'{r["name"]} •••• {last4}'
+    return mp
+
+
+def tx_signature(dt_, kind, amount, category, description, status, method,
+                 account_id, card_id, statement_month, installments_total):
+    return str((
+        str(dt_), kind, round(float(amount or 0), 2),
+        (category or "").strip().lower(),
+        (description or "").strip().lower(),
+        status, method,
+        int(account_id) if account_id else None,
+        int(card_id) if card_id else None,
+        statement_month or "",
+        int(installments_total) if installments_total else 1
+    ))
+
+
 # =========================
 # Login (Streamlit Secrets)
 # =========================
@@ -198,7 +263,7 @@ def ensure_schema():
         );
         """)
 
-        # Transferências
+        # Transferências (Conta -> Conta)
         con.execute("""
         CREATE TABLE IF NOT EXISTS transfers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -228,7 +293,7 @@ def seed_if_empty():
             con.execute("INSERT INTO accounts (name,type,initial_balance) VALUES (?,?,?)", ("Carteira", "CASH", 0))
             con.commit()
 
-    # cria "Reserva/Investimentos" se não existir
+    # cria conta Reserva/Investimentos se não existir
     with conectar() as con:
         exists = con.execute(
             "SELECT COUNT(*) FROM accounts WHERE LOWER(name)=LOWER(?)",
@@ -294,7 +359,7 @@ def carregar_transactions():
     with conectar() as con:
         df = pd.read_sql_query("SELECT * FROM transactions ORDER BY dt DESC, id DESC", con)
 
-    df["dt"] = to_dt(df["dt"]).dt.date
+    df["dt"] = to_dt(df["dt"])
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
     for c in ["category", "description", "statement_month"]:
         df[c] = df[c].fillna("")
@@ -307,7 +372,7 @@ def carregar_transactions():
 def carregar_transfers():
     with conectar() as con:
         df = pd.read_sql_query("SELECT * FROM transfers ORDER BY dt DESC, id DESC", con)
-    df["dt"] = to_dt(df["dt"]).dt.date
+    df["dt"] = to_dt(df["dt"])
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
     df["description"] = df["description"].fillna("")
     return df
@@ -403,6 +468,7 @@ def card_statement_total(card_id: int, statement_month: str, tx: pd.DataFrame) -
 
 def create_installments_on_card(dt_: date, total_amount: float, n: int, category: str, description: str,
                                 card_id: int, closing_day: int, status: str):
+    # Divide total em n parcelas, ajustando centavos na última
     per = round(float(total_amount) / int(n), 2)
     amounts = [per] * n
     diff = round(float(total_amount) - sum(amounts), 2)
@@ -416,7 +482,7 @@ def create_installments_on_card(dt_: date, total_amount: float, n: int, category
             kind="EXPENSE",
             amount=amounts[i - 1],
             category=category,
-            description=f"{description} ({i}/{n})",
+            description=f"{description} ({i}/{n})" if description else f"Parcela ({i}/{n})",
             status=status,
             method="CARD",
             card_id=card_id,
@@ -433,7 +499,12 @@ def run_recurrences_for_month(target_ym: str):
 
     tx = carregar_transactions()
     start, end = month_range(target_ym)
-    existing_ids = set(tx[(tx["dt"] >= start) & (tx["dt"] <= end)]["recurrence_id"].dropna().astype(int).tolist())
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end) + pd.Timedelta(days=1)  # exclusivo
+
+    existing_ids = set(
+        tx[(tx["dt"] >= start_ts) & (tx["dt"] < end_ts)]["recurrence_id"].dropna().astype(int).tolist()
+    )
 
     created = 0
     cards = carregar_cards()
@@ -490,7 +561,10 @@ def calc_long_goal_plan(goal_row: dict, tx: pd.DataFrame) -> dict:
     start_amount = float(goal_row["start_amount"])
 
     total_months = max(1, months_between(start_date, end_date))
-    period = tx[(tx["dt"] >= start_date) & (tx["dt"] <= end_date) & (tx["status"] == "PAID")].copy()
+
+    start_ts = pd.Timestamp(start_date)
+    end_ts = pd.Timestamp(end_date) + pd.Timedelta(days=1)
+    period = tx[(tx["dt"] >= start_ts) & (tx["dt"] < end_ts) & (tx["status"] == "PAID")].copy()
 
     income = float(period[period["kind"] == "INCOME"]["amount"].sum())
     out_bank_cash = float(period[(period["kind"] == "EXPENSE") & (period["method"].isin(["BANK", "CASH"]))]["amount"].sum())
@@ -518,7 +592,10 @@ def calc_long_goal_plan(goal_row: dict, tx: pd.DataFrame) -> dict:
 
 def current_month_savings(tx: pd.DataFrame, ym: str) -> float:
     start, end = month_range(ym)
-    month_paid = tx[(tx["dt"] >= start) & (tx["dt"] <= end) & (tx["status"] == "PAID")].copy()
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end) + pd.Timedelta(days=1)
+
+    month_paid = tx[(tx["dt"] >= start_ts) & (tx["dt"] < end_ts) & (tx["status"] == "PAID")].copy()
     income = float(month_paid[month_paid["kind"] == "INCOME"]["amount"].sum())
     out_bank_cash = float(month_paid[(month_paid["kind"] == "EXPENSE") & (month_paid["method"].isin(["BANK", "CASH"]))]["amount"].sum())
     card_pay = float(month_paid[(month_paid["method"] == "CARD_PAYMENT")]["amount"].sum())
@@ -527,7 +604,7 @@ def current_month_savings(tx: pd.DataFrame, ym: str) -> float:
 
 def is_discretionary(category: str, rules_df: pd.DataFrame) -> bool:
     cat = (category or "").strip().lower()
-    if not cat:
+    if not cat or rules_df.empty:
         return False
     hit = rules_df[rules_df["category"].str.lower() == cat]
     if hit.empty:
@@ -540,11 +617,6 @@ def is_discretionary(category: str, rules_df: pd.DataFrame) -> bool:
 # =========================
 ensure_schema()
 seed_if_empty()
-
-accounts = carregar_accounts()
-cards = carregar_cards()
-goals = carregar_goals()
-tx = carregar_transactions()
 
 st.title("💳 Finanças Pessoais")
 st.caption("Contas, cartão de crédito, metas, recorrências, parcelamentos, transferências e relatórios.")
@@ -562,91 +634,83 @@ tabs = st.tabs([
 
 
 # =========================
-# Dashboard
+# Dashboard (modelo 1.0)
 # =========================
 with tabs[0]:
-    hoje = date.today()
+    tx = carregar_transactions()
+    cards = carregar_cards()
+    accounts = carregar_accounts()
 
-    # inclui meses de fatura também
+    hoje = date.today()
+    hoje_ym = hoje.strftime("%Y-%m")
+
+    # meses do filtro: meses por dt + meses por statement_month + mês atual
     all_months = sorted(
         {d.strftime("%Y-%m") for d in pd.to_datetime(tx["dt"], errors="coerce").dropna()}
         | set(tx.loc[(tx["method"] == "CARD") & (tx["statement_month"] != ""), "statement_month"].astype(str).tolist())
-        | {hoje.strftime("%Y-%m")}
+        | {hoje_ym}
     )
 
     ym = st.selectbox(
-        "Mês",
-        options=all_months,
-        index=all_months.index(hoje.strftime("%Y-%m")) if hoje.strftime("%Y-%m") in all_months else 0,
+        "📅 Mês",
+        all_months,
+        index=all_months.index(hoje_ym) if hoje_ym in all_months else 0,
+        format_func=fmt_month_br,
         key="dash_month"
     )
 
+    # Fluxo de caixa do mês (por dt)
     start, end = month_range(ym)
-    month_tx = tx[(tx["dt"] >= start) & (tx["dt"] <= end)].copy()
-    month_paid = month_tx[month_tx["status"] == "PAID"].copy()
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end) + pd.Timedelta(days=1)
+
+    month_paid = tx[(tx["status"] == "PAID") & (tx["dt"] >= start_ts) & (tx["dt"] < end_ts)].copy()
 
     income = float(month_paid[month_paid["kind"] == "INCOME"]["amount"].sum())
-    expense_bank_cash = float(month_paid[(month_paid["kind"] == "EXPENSE") & (month_paid["method"].isin(["BANK", "CASH"]))]["amount"].sum())
-    card_payments = float(month_paid[(month_paid["method"] == "CARD_PAYMENT")]["amount"].sum())
-    savings = income - expense_bank_cash - card_payments
+    expense_bank = float(
+        month_paid[(month_paid["kind"] == "EXPENSE") & (month_paid["method"].isin(["BANK", "CASH"]))]["amount"].sum()
+    )
+    card_pay = float(month_paid[month_paid["method"] == "CARD_PAYMENT"]["amount"].sum())
+    economy = income - expense_bank - card_pay
 
+    # BLOCO 1 — métricas
     if mobile_mode:
         c1, c2 = st.columns(2)
-        c1.metric("Entradas", f"R$ {income:,.2f}")
-        c2.metric("Saídas", f"R$ {expense_bank_cash:,.2f}")
+        c1.metric("💰 Entradas", fmt_currency(income))
+        c2.metric("💸 Saídas", fmt_currency(expense_bank))
         c3, c4 = st.columns(2)
-        c3.metric("Pag. fatura", f"R$ {card_payments:,.2f}")
-        c4.metric("Economia", f"R$ {savings:,.2f}")
+        c3.metric("💳 Pag. fatura", fmt_currency(card_pay))
+        c4.metric("📈 Economia", fmt_currency(economy))
     else:
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Entradas (pagas)", f"R$ {income:,.2f}")
-        c2.metric("Saídas (conta/carteira)", f"R$ {expense_bank_cash:,.2f}")
-        c3.metric("Pagamentos de fatura", f"R$ {card_payments:,.2f}")
-        c4.metric("Economia do mês", f"R$ {savings:,.2f}")
+        c1.metric("💰 Entradas", fmt_currency(income))
+        c2.metric("💸 Saídas", fmt_currency(expense_bank))
+        c3.metric("💳 Pagamentos de fatura", fmt_currency(card_pay))
+        c4.metric("📈 Economia", fmt_currency(economy))
 
     st.divider()
 
-    exp = month_paid[(month_paid["kind"] == "EXPENSE") & (month_paid["method"].isin(["BANK", "CASH", "CARD_PAYMENT"]))].copy()
-    if exp.empty:
-        st.info("Sem despesas pagas neste mês.")
-    else:
-        exp["category"] = exp["category"].replace("", "Sem categoria")
-        cat = exp.groupby("category")["amount"].sum().sort_values(ascending=False)
-        st.subheader("Despesas por categoria (pagas)")
-        st.bar_chart(cat)
+    # BLOCO 2 — cartões
+    st.subheader("💳 Cartões do mês")
 
-    st.subheader("Saldos das contas (pagos)")
-    accounts = carregar_accounts()
-    tx = carregar_transactions()
-    bal_rows = [{"Conta": a["name"], "Tipo": a["type"], "Saldo": calc_account_balance(int(a["id"]), tx, accounts)}
-                for _, a in accounts.iterrows()]
-    st.dataframe(pd.DataFrame(bal_rows), use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    st.subheader("💳 Cartões – fatura do mês")
     WARN_PCT = 20.0
     HIGH_PCT = 30.0
-    income_month = float(month_paid[month_paid["kind"] == "INCOME"]["amount"].sum())
 
-    if income_month <= 0:
-        st.warning("⚠️ Sem renda (entradas pagas) registrada neste mês. Os alertas por % ficarão desativados.")
-
-    cards = carregar_cards()
-    tx = carregar_transactions()
+    if income <= 0:
+        st.warning("⚠️ Nenhuma renda registrada neste mês (as porcentagens dos cartões ficam desativadas).")
 
     if cards.empty:
-        st.info("Cadastre cartões para ver os valores aqui.")
+        st.info("Nenhum cartão cadastrado.")
     else:
         per_row = 1 if mobile_mode else 3
         grid = st.columns(per_row)
 
         for i, row in enumerate(cards.itertuples(index=False)):
-            total = card_statement_total(row.id, ym, tx)
+            total_stmt = card_statement_total(row.id, ym, tx)
             last4 = getattr(row, "last4", "") or "----"
 
-            if income_month > 0:
-                pct = (total / income_month) * 100
+            if income > 0:
+                pct = (total_stmt / income) * 100
                 if pct >= HIGH_PCT:
                     badge = f"🔴 Alto ({pct:.1f}%)"
                 elif pct >= WARN_PCT:
@@ -660,100 +724,101 @@ with tabs[0]:
                 st.markdown(
                     f"""
                     <div style="
-                        border-radius: 14px;
-                        padding: 14px;
-                        border: 1px solid rgba(255,255,255,0.12);
-                        background: rgba(255,255,255,0.03);
+                        border-radius: 16px;
+                        padding: 16px;
+                        border: 1px solid rgba(255,255,255,0.10);
+                        background: rgba(255,255,255,0.035);
                         margin-bottom: 12px;
                     ">
                         <div style="display:flex; justify-content:space-between; align-items:center; gap:10px;">
-                            <div style="font-weight:600; font-size:16px;">💳 {row.name}</div>
-                            <div style="font-size:12px; opacity:0.9;">{badge}</div>
+                            <div style="font-weight:700; font-size:16px;">💳 {row.name}</div>
+                            <div style="font-size:12px; opacity:0.95;">{badge}</div>
                         </div>
-                        <div style="opacity:0.7; margin-bottom:8px;">Final •••• {last4}</div>
-                        <div style="font-size:13px; opacity:0.8;">Fatura do mês</div>
-                        <div style="font-size:20px; font-weight:700;">R$ {total:,.2f}</div>
+                        <div style="opacity:0.70; margin-top:2px;">Final •••• {last4}</div>
+                        <div style="margin-top:10px; font-size:13px; opacity:0.75;">Fatura do mês</div>
+                        <div style="font-size:22px; font-weight:800;">{fmt_currency(total_stmt)}</div>
                     </div>
                     """,
                     unsafe_allow_html=True
                 )
 
-        st.markdown("### 🧠 Insights do mês (cartões)")
+    st.divider()
+
+    # BLOCO 3 — insights
+    st.subheader("🧠 Insights do mês (cartões)")
+
+    if cards.empty:
+        st.info("Cadastre cartões para ver insights.")
+    else:
         rows = []
         for row in cards.itertuples(index=False):
-            total = float(card_statement_total(row.id, ym, tx))
+            total_stmt = float(card_statement_total(row.id, ym, tx))
             last4 = getattr(row, "last4", "") or "----"
-
-            if income_month > 0:
-                pct = (total / income_month) * 100
-                limit_high = (HIGH_PCT / 100) * income_month
-                limit_warn = (WARN_PCT / 100) * income_month
-                reduce_to_high = max(0.0, total - limit_high)
-                reduce_to_warn = max(0.0, total - limit_warn)
-            else:
-                pct = None
-                reduce_to_high = None
-                reduce_to_warn = None
-
+            pct = (total_stmt / income) * 100 if income > 0 else None
             rows.append({
-                "cartao": row.name,
-                "final": last4,
-                "total": total,
-                "pct": pct,
-                "reduce_to_high": reduce_to_high,
-                "reduce_to_warn": reduce_to_warn,
+                "Cartão": f"{row.name} •••• {last4}",
+                "Total": total_stmt,
+                "% da renda": pct
             })
 
-        df_cards = pd.DataFrame(rows).sort_values("total", ascending=False)
-        if df_cards["total"].sum() <= 0:
+        df_cards = pd.DataFrame(rows).sort_values("Total", ascending=False)
+        if df_cards["Total"].sum() <= 0:
             st.info("Sem gastos em cartão neste mês.")
         else:
             top3 = df_cards.head(3).copy()
-            if mobile_mode:
-                c1 = st.container()
-                c2 = st.container()
-            else:
-                c1, c2 = st.columns([2, 3])
+            top3_view = top3.copy()
+            top3_view["Total"] = top3_view["Total"].map(fmt_currency)
+            top3_view["% da renda"] = top3_view["% da renda"].map(lambda x: "—" if pd.isna(x) else f"{x:.1f}%")
+            st.dataframe(top3_view, use_container_width=True, hide_index=True)
 
-            with c1:
-                st.subheader("Top 3 cartões do mês")
-                view = top3.copy()
-                view["Cartão"] = view.apply(lambda r: f"{r['cartao']} •••• {r['final']}", axis=1)
-                view["Fatura"] = view["total"].map(lambda x: f"R$ {x:,.2f}")
-                view["% da renda"] = view["pct"].map(lambda x: "—" if pd.isna(x) else f"{x:.1f}%")
-                st.dataframe(view[["Cartão", "Fatura", "% da renda"]], use_container_width=True, hide_index=True)
+            if income > 0:
+                high = df_cards[df_cards["% da renda"] >= HIGH_PCT]
+                warn = df_cards[(df_cards["% da renda"] >= WARN_PCT) & (df_cards["% da renda"] < HIGH_PCT)]
 
-            with c2:
-                st.subheader("O que ajustar para voltar pro caminho certo")
-                if income_month <= 0:
-                    st.warning("Sem renda no mês: não dá para calcular alertas por %. Lance uma entrada (ex: Salário).")
+                if high.empty and warn.empty:
+                    st.success("✅ Seus cartões estão em zona verde/ok (nenhum acima de 20% da renda).")
                 else:
-                    total_cards = float(df_cards["total"].sum())
-                    total_pct = (total_cards / income_month) * 100
-                    st.caption(f"Total em cartões no mês: **R$ {total_cards:,.2f}**  |  **{total_pct:.1f}%** da renda")
+                    if not high.empty:
+                        st.markdown("**🔴 Cartões em nível Alto (≥ 30%)**")
+                        for _, r in high.iterrows():
+                            limit_high = (HIGH_PCT / 100) * income
+                            limit_warn = (WARN_PCT / 100) * income
+                            reduce_to_high = max(0.0, float(r["Total"]) - limit_high)
+                            reduce_to_warn = max(0.0, float(r["Total"]) - limit_warn)
+                            st.write(
+                                f"- **{r['Cartão']}**: {r['% da renda']:.1f}% "
+                                f"→ reduzir **{fmt_currency(reduce_to_high)}** para ficar < 30% "
+                                f"(e **{fmt_currency(reduce_to_warn)}** para ficar < 20%)."
+                            )
+                    if not warn.empty:
+                        st.markdown("**🟡 Cartões em Atenção (≥ 20%)**")
+                        for _, r in warn.iterrows():
+                            limit_warn = (WARN_PCT / 100) * income
+                            reduce_to_warn = max(0.0, float(r["Total"]) - limit_warn)
+                            st.write(
+                                f"- **{r['Cartão']}**: {r['% da renda']:.1f}% "
+                                f"→ reduzir **{fmt_currency(reduce_to_warn)}** para ficar < 20%."
+                            )
+            else:
+                st.info("Lance uma entrada (ex: salário) para habilitar alertas por % da renda.")
 
-                    high = df_cards[df_cards["pct"] >= HIGH_PCT].copy()
-                    warn = df_cards[(df_cards["pct"] >= WARN_PCT) & (df_cards["pct"] < HIGH_PCT)].copy()
+    st.divider()
 
-                    if high.empty and warn.empty:
-                        st.success("✅ Seus cartões estão em zona verde/ok (nenhum acima de 20% da renda).")
-                    else:
-                        if not high.empty:
-                            st.markdown("**🔴 Cartões em nível Alto (≥ 30%)**")
-                            for _, r in high.iterrows():
-                                st.write(
-                                    f"- **{r['cartao']} •••• {r['final']}**: {r['pct']:.1f}%  "
-                                    f"→ reduzir **R$ {r['reduce_to_high']:,.2f}** para ficar < 30% "
-                                    f"(e **R$ {r['reduce_to_warn']:,.2f}** para ficar < 20%)."
-                                )
+    # BLOCO 4 — saldos
+    st.subheader("🏦 Saldos das contas")
+    bal_rows = [{"Conta": a["name"], "Tipo": a["type"], "Saldo": calc_account_balance(int(a["id"]), tx, accounts)}
+                for _, a in accounts.iterrows()]
+    df_bal = pd.DataFrame(bal_rows)
+    df_bal["Saldo"] = df_bal["Saldo"].map(fmt_currency)
+    st.dataframe(df_bal, use_container_width=True, hide_index=True)
 
-                        if not warn.empty:
-                            st.markdown("**🟡 Cartões em Atenção (≥ 20%)**")
-                            for _, r in warn.iterrows():
-                                st.write(
-                                    f"- **{r['cartao']} •••• {r['final']}**: {r['pct']:.1f}%  "
-                                    f"→ reduzir **R$ {r['reduce_to_warn']:,.2f}** para ficar < 20%."
-                                )
+    # Aviso final do mês
+    if economy < 0:
+        st.error("🚨 Você gastou mais do que ganhou neste mês.")
+    elif economy == 0:
+        st.info("ℹ️ Mês zerado. Não houve economia.")
+    else:
+        st.success("✅ Você conseguiu economizar neste mês.")
 
 
 # =========================
@@ -767,142 +832,164 @@ with tabs[1]:
     rules = carregar_category_rules()
     tx = carregar_transactions()
 
-    colA, colB, colC, colD = st.columns(4) if not mobile_mode else (st.columns(2) + st.columns(2))
+    acc_map = map_accounts(accounts)
+    card_map = map_cards(cards)
 
-    with colA:
-        kind = st.selectbox("Tipo", ["INCOME", "EXPENSE"],
-                            format_func=lambda x: "Entrada" if x == "INCOME" else "Saída",
-                            key="tx_kind")
-    with colB:
-        method = st.selectbox("Meio", ["BANK", "CASH", "CARD"],
-                              format_func=lambda x: {"BANK": "Conta", "CASH": "Dinheiro", "CARD": "Cartão"}[x],
-                              key="tx_method")
-    with colC:
-        dt_ = st.date_input("Data", value=date.today(), key="tx_date")
-    with colD:
-        status = st.selectbox("Status", ["PAID", "PENDING"],
-                              format_func=lambda x: "Pago" if x == "PAID" else "Pendente",
-                              key="tx_status")
+    with st.form("form_lancamento", clear_on_submit=False):
+        colA, colB, colC, colD = st.columns(4) if not mobile_mode else (st.columns(2) + st.columns(2))
 
-    if mobile_mode:
-        amount = st.number_input("Valor", min_value=0.0, step=10.0, key="tx_amount")
-        category = st.text_input("Categoria", placeholder="Ex: Mercado, Aluguel, Salário...", key="tx_category")
-        description = st.text_input("Descrição", placeholder="Opcional", key="tx_desc")
-    else:
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            amount = st.number_input("Valor", min_value=0.0, step=10.0, key="tx_amount")
-        with col2:
-            category = st.text_input("Categoria", placeholder="Ex: Mercado, Aluguel, Salário...", key="tx_category")
-        with col3:
-            description = st.text_input("Descrição", placeholder="Opcional", key="tx_desc")
+        with colA:
+            kind = st.selectbox("Tipo", ["INCOME", "EXPENSE"],
+                                format_func=lambda x: "Entrada" if x == "INCOME" else "Saída")
+        with colB:
+            method = st.selectbox("Meio", ["BANK", "CASH", "CARD"],
+                                  format_func=lambda x: {"BANK": "Conta", "CASH": "Dinheiro", "CARD": "Cartão"}[x])
+        with colC:
+            dt_ = st.date_input("Data", value=date.today())
+        with colD:
+            status = st.selectbox("Status", ["PAID", "PENDING"],
+                                  format_func=lambda x: "Pago" if x == "PAID" else "Pendente")
 
-    # classificação
-    if (category or "").strip():
-        if is_discretionary(category, rules):
+        if mobile_mode:
+            amount = st.number_input("Valor", min_value=0.0, step=10.0)
+            category = st.text_input("Categoria", placeholder="Ex: Moradia, Mercado, Salário...")
+            description = st.text_input("Descrição", placeholder="Opcional")
+        else:
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                amount = st.number_input("Valor", min_value=0.0, step=10.0)
+            with col2:
+                category = st.text_input("Categoria", placeholder="Ex: Moradia, Mercado, Salário...")
+            with col3:
+                description = st.text_input("Descrição", placeholder="Opcional")
+
+        if (category or "").strip() and is_discretionary(category, rules):
             st.info("🏷️ Categoria classificada como **Discricionária** (pode gerar alerta na meta por prazo).")
 
-    account_id = None
-    card_id = None
-    statement_month = None
-    installments_total = None
+        account_id = None
+        card_id = None
+        statement_month = None
+        installments_total = 1
+        closing_day = None
 
-    if method in ["BANK", "CASH"]:
-        acc_opts = accounts[accounts["type"] == ("BANK" if method == "BANK" else "CASH")].copy()
-        if acc_opts.empty:
-            st.warning("Você não tem conta desse tipo cadastrada. Vá em 'Contas' e crie uma.")
+        if method in ["BANK", "CASH"]:
+            acc_opts = accounts[accounts["type"] == ("BANK" if method == "BANK" else "CASH")].copy()
+            if acc_opts.empty:
+                st.warning("Você não tem conta desse tipo cadastrada. Vá em 'Contas' e crie uma.")
+            else:
+                account_id = st.selectbox(
+                    "Conta",
+                    acc_opts["id"].tolist(),
+                    format_func=lambda i: acc_map.get(int(i), str(i))
+                )
         else:
-            account_id = st.selectbox("Conta", acc_opts["id"].tolist(),
-                                      format_func=lambda i: acc_opts.loc[acc_opts["id"] == i, "name"].iloc[0],
-                                      key="tx_account")
-    else:
-        if cards.empty:
-            st.warning("Você não tem cartão cadastrado. Vá em 'Cartões' e crie um.")
+            if cards.empty:
+                st.warning("Você não tem cartão cadastrado. Vá em 'Cartões' e crie um.")
+            else:
+                card_id = st.selectbox(
+                    "Cartão",
+                    cards["id"].tolist(),
+                    format_func=lambda i: card_map.get(int(i), str(i))
+                )
+                closing_day = int(cards.loc[cards["id"] == card_id, "closing_day"].iloc[0])
+                installments_total = st.number_input("Parcelas", min_value=1, max_value=36, value=1, step=1)
+                statement_month = compute_statement_month(dt_, closing_day)
+                st.caption(f"📌 Vai para a fatura: **{fmt_month_br(statement_month)}** (fechamento dia {closing_day})")
+
+        # alerta meta por prazo (gastos discricionários)
+        lg = carregar_long_goal()
+        if kind == "EXPENSE" and status == "PAID" and (category or "").strip() and not lg.empty and is_discretionary(category, rules):
+            goal_row = lg.iloc[0].to_dict()
+            plan = calc_long_goal_plan(goal_row, tx)
+            required_per_month = float(plan["need_per_month"])
+            ym_tx = dt_.strftime("%Y-%m")
+            current_save = current_month_savings(tx, ym_tx)
+
+            if required_per_month > 0 and current_save < required_per_month:
+                gap = required_per_month - current_save
+                st.warning(
+                    f"⚠️ Gasto **discricionário** e você está abaixo do necessário para a meta.\n\n"
+                    f"- Meta: **{goal_row['name']}**\n"
+                    f"- Necessário/mês (média): **{fmt_currency(required_per_month)}**\n"
+                    f"- Economia do mês (estimada): **{fmt_currency(current_save)}**\n"
+                    f"- Falta para bater a média: **{fmt_currency(gap)}**\n\n"
+                    f"💡 Sugestão: compense economizando **+{fmt_currency(float(amount))}** até o fim do mês."
+                )
+
+        submitted = st.form_submit_button("Salvar lançamento ✅", use_container_width=True)
+
+    if submitted:
+        sig = tx_signature(dt_, kind, amount, category, description, status, method,
+                           account_id, card_id, statement_month, installments_total)
+
+        if st.session_state.get("last_tx_sig") == sig:
+            st.warning("Esse lançamento parece ter sido enviado duas vezes. Evitei duplicar ✅")
         else:
-            card_id = st.selectbox("Cartão", cards["id"].tolist(),
-                                   format_func=lambda i: cards.loc[cards["id"] == i, "name"].iloc[0],
-                                   key="tx_card")
-            closing_day = int(cards.loc[cards["id"] == card_id, "closing_day"].iloc[0])
+            st.session_state["last_tx_sig"] = sig
 
-            with st.expander("💳 Parcelamento (opcional)"):
-                installments_total = st.number_input("Número de parcelas", min_value=1, max_value=36, value=1, step=1,
-                                                     key="tx_installments")
-                st.caption("Se parcelas > 1, o sistema cria automaticamente (1/n) em cada fatura.")
+            if method == "CARD" and installments_total and int(installments_total) > 1:
+                create_installments_on_card(dt_, amount, int(installments_total), category, description,
+                                            int(card_id), int(closing_day), status)
+                st.success(
+                    f"✅ Lançamento parcelado salvo\n\n"
+                    f"💳 Cartão: **{card_map.get(int(card_id))}**\n"
+                    f"📆 **{int(installments_total)}x** (veja em 'Cartões' → faturas)\n"
+                    f"🧾 Começa em: **{fmt_month_br(statement_month)}**"
+                )
+            else:
+                add_transaction(dt_, kind, amount, category, description, status, method,
+                                account_id, card_id, statement_month)
+                st.success("✅ Lançamento salvo!")
 
-            statement_month = compute_statement_month(dt_, closing_day)
-            st.caption(f"📌 Vai para a fatura: **{statement_month}** (fechamento dia {closing_day})")
-
-    # alerta da meta por prazo
-    lg = carregar_long_goal()
-    if kind == "EXPENSE" and status == "PAID" and (category or "").strip() and not lg.empty and is_discretionary(category, rules):
-        goal_row = lg.iloc[0].to_dict()
-        plan = calc_long_goal_plan(goal_row, tx)
-        required_per_month = float(plan["need_per_month"])
-        ym_tx = dt_.strftime("%Y-%m")
-        current_save = current_month_savings(tx, ym_tx)
-
-        if required_per_month > 0 and current_save < required_per_month:
-            gap = required_per_month - current_save
-            st.warning(
-                f"⚠️ Gasto **discricionário** e você está abaixo do necessário para a meta.\n\n"
-                f"- Meta: **{goal_row['name']}**\n"
-                f"- Necessário/mês (média): **R$ {required_per_month:,.2f}**\n"
-                f"- Economia do mês (estimada): **R$ {current_save:,.2f}**\n"
-                f"- Falta para bater a média: **R$ {gap:,.2f}**\n\n"
-                f"💡 Sugestão: compense economizando **+R$ {float(amount):,.2f}** até o fim do mês."
-            )
-
-    if st.button("Salvar lançamento ✅", use_container_width=True, key="tx_save_btn"):
-        if method == "CARD" and installments_total and int(installments_total) > 1:
-            create_installments_on_card(dt_, amount, int(installments_total), category, description, int(card_id), int(closing_day), status)
-        else:
-            add_transaction(dt_, kind, amount, category, description, status, method, account_id, card_id, statement_month)
-        st.success("Lançamento salvo!")
         st.rerun()
 
+    # Transferências
     st.divider()
     st.subheader("🔁 Transferência (Conta → Conta)")
     st.caption("Transferência não conta como despesa. Use para mover dinheiro para Reserva/Investimentos, poupança, etc.")
 
     accounts = carregar_accounts()
     tr = carregar_transfers()
+    acc_map = map_accounts(accounts)
 
     if accounts.empty or len(accounts) < 2:
         st.warning("Você precisa de pelo menos 2 contas cadastradas para transferir.")
     else:
-        if mobile_mode:
-            tr_date = st.date_input("Data", value=date.today(), key="tr_date")
-            tr_status = st.selectbox("Status", ["PAID", "PENDING"],
-                                     format_func=lambda x: "Pago" if x == "PAID" else "Pendente",
-                                     key="tr_status")
-            tr_amount = st.number_input("Valor", min_value=0.0, step=50.0, key="tr_amount")
-        else:
-            c1, c2, c3 = st.columns(3)
-            with c1:
+        with st.form("form_transfer", clear_on_submit=True):
+            if mobile_mode:
                 tr_date = st.date_input("Data", value=date.today(), key="tr_date")
-            with c2:
                 tr_status = st.selectbox("Status", ["PAID", "PENDING"],
                                          format_func=lambda x: "Pago" if x == "PAID" else "Pendente",
                                          key="tr_status")
-            with c3:
                 tr_amount = st.number_input("Valor", min_value=0.0, step=50.0, key="tr_amount")
+            else:
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    tr_date = st.date_input("Data", value=date.today(), key="tr_date")
+                with c2:
+                    tr_status = st.selectbox("Status", ["PAID", "PENDING"],
+                                             format_func=lambda x: "Pago" if x == "PAID" else "Pendente",
+                                             key="tr_status")
+                with c3:
+                    tr_amount = st.number_input("Valor", min_value=0.0, step=50.0, key="tr_amount")
 
-        ids = accounts["id"].tolist()
-        names = {int(r["id"]): r["name"] for _, r in accounts.iterrows()}
+            ids = accounts["id"].tolist()
 
-        if mobile_mode:
-            from_id = st.selectbox("De (origem)", ids, format_func=lambda i: names[int(i)], key="tr_from")
-            to_id = st.selectbox("Para (destino)", ids, format_func=lambda i: names[int(i)], key="tr_to")
-            tr_desc = st.text_input("Descrição", placeholder="Ex: aporte do mês", key="tr_desc")
-        else:
-            c4, c5 = st.columns(2)
-            with c4:
-                from_id = st.selectbox("De (origem)", ids, format_func=lambda i: names[int(i)], key="tr_from")
-            with c5:
-                to_id = st.selectbox("Para (destino)", ids, format_func=lambda i: names[int(i)], key="tr_to")
-            tr_desc = st.text_input("Descrição", placeholder="Ex: aporte do mês", key="tr_desc")
+            if mobile_mode:
+                from_id = st.selectbox("De (origem)", ids, format_func=lambda i: acc_map.get(int(i), str(i)), key="tr_from")
+                to_id = st.selectbox("Para (destino)", ids, format_func=lambda i: acc_map.get(int(i), str(i)), key="tr_to")
+                tr_desc = st.text_input("Descrição", placeholder="Ex: aporte do mês", key="tr_desc")
+            else:
+                c4, c5 = st.columns(2)
+                with c4:
+                    from_id = st.selectbox("De (origem)", ids, format_func=lambda i: acc_map.get(int(i), str(i)), key="tr_from")
+                with c5:
+                    to_id = st.selectbox("Para (destino)", ids, format_func=lambda i: acc_map.get(int(i), str(i)), key="tr_to")
+                tr_desc = st.text_input("Descrição", placeholder="Ex: aporte do mês", key="tr_desc")
 
-        if st.button("Salvar transferência ✅", use_container_width=True, key="tr_save"):
+            tr_submit = st.form_submit_button("Salvar transferência ✅", use_container_width=True)
+
+        if tr_submit:
             if from_id == to_id:
                 st.error("Origem e destino não podem ser a mesma conta.")
             elif tr_amount <= 0:
@@ -913,13 +1000,17 @@ with tabs[1]:
                 st.rerun()
 
         st.markdown("### Últimas transferências")
+        tr = carregar_transfers()
         if tr.empty:
             st.info("Nenhuma transferência registrada ainda.")
         else:
             view = tr.copy()
-            view["de"] = view["from_account_id"].map(lambda i: names.get(int(i), "—"))
-            view["para"] = view["to_account_id"].map(lambda i: names.get(int(i), "—"))
-            st.dataframe(view[["id", "dt", "amount", "de", "para", "status", "description"]],
+            view["Data"] = view["dt"].apply(fmt_date_br)
+            view["De"] = view["from_account_id"].astype(int).map(lambda i: acc_map.get(i, "—"))
+            view["Para"] = view["to_account_id"].astype(int).map(lambda i: acc_map.get(i, "—"))
+            view["Status"] = view["status"].map({"PAID": "Pago", "PENDING": "Pendente"})
+            view["Valor"] = view["amount"].map(fmt_currency)
+            st.dataframe(view[["id", "Data", "Valor", "De", "Para", "Status", "description"]],
                          use_container_width=True, hide_index=True)
 
         with st.expander("🗑️ Excluir transferência"):
@@ -930,36 +1021,89 @@ with tabs[1]:
                     st.success("Transferência excluída.")
                     st.rerun()
 
+    # Últimos lançamentos (checkbox + ações)
     st.divider()
     st.subheader("Últimos lançamentos")
+
     tx = carregar_transactions()
+    accounts = carregar_accounts()
+    cards = carregar_cards()
+    acc_map = map_accounts(accounts)
+    card_map = map_cards(cards)
+
     tx_view = tx.copy()
-    tx_view["tipo"] = tx_view["kind"].map({"INCOME": "Entrada", "EXPENSE": "Saída"})
-    tx_view["meio"] = tx_view["method"].map({"BANK": "Conta", "CASH": "Dinheiro", "CARD": "Cartão", "CARD_PAYMENT": "Pag. Cartão"})
-    tx_view["parcela"] = tx_view.apply(
-        lambda r: f"{int(r['installment_no'])}/{int(r['installments_total'])}"
-        if pd.notna(r.get("installments_total")) and pd.notna(r.get("installment_no")) else "",
+    tx_view["Data"] = tx_view["dt"].apply(fmt_date_br)
+    tx_view["Tipo"] = tx_view["kind"].map({"INCOME": "Entrada", "EXPENSE": "Saída"})
+    tx_view["Status"] = tx_view["status"].map({"PAID": "Pago", "PENDING": "Pendente"})
+    tx_view["Meio"] = tx_view["method"].map({"BANK": "Conta", "CASH": "Dinheiro", "CARD": "Cartão", "CARD_PAYMENT": "Pag. Cartão"})
+    tx_view["Categoria"] = tx_view["category"].replace("", "—")
+    tx_view["Descrição"] = tx_view["description"].replace("", "—")
+    tx_view["Conta"] = tx_view["account_id"].fillna(0).astype(int).map(lambda i: acc_map.get(i, "—"))
+    tx_view["Cartão"] = tx_view["card_id"].fillna(0).astype(int).map(lambda i: card_map.get(i, "—"))
+
+    tx_view["Parcela"] = tx_view.apply(
+        lambda r: fmt_installment(r.get("installment_no"), r.get("installments_total"), r.get("statement_month")),
         axis=1
     )
-    st.dataframe(
-        tx_view[["id", "dt", "tipo", "amount", "category", "description", "status", "meio", "account_id", "card_id", "statement_month", "parcela"]],
-        use_container_width=True, hide_index=True
+
+    tx_view["Valor"] = tx_view["amount"].astype(float)
+    tx_view["Total (parcelado)"] = tx_view.apply(
+        lambda r: float(r["amount"]) * int(r["installments_total"])
+        if pd.notna(r.get("installments_total")) and int(r.get("installments_total") or 0) > 1 else float(r["amount"]),
+        axis=1
     )
 
-    with st.expander("🗑️ Excluir lançamento"):
-        del_id = st.number_input("ID para excluir", min_value=0, step=1, key="tx_del_id")
-        if st.button("Excluir", type="secondary", key="tx_del_btn"):
-            if del_id > 0:
-                delete_transaction(int(del_id))
-                st.success("Excluído.")
-                st.rerun()
+    tx_view = tx_view.sort_values(["dt", "id"], ascending=[False, False]).head(200)
+
+    editor_df = tx_view[["id", "Data", "Tipo", "Status", "Meio", "Valor", "Total (parcelado)",
+                         "Categoria", "Descrição", "Conta", "Cartão", "Parcela"]].copy()
+    editor_df.insert(0, "Selecionar", False)
+
+    edited = st.data_editor(
+        editor_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Valor": st.column_config.NumberColumn(format="R$ %.2f"),
+            "Total (parcelado)": st.column_config.NumberColumn(format="R$ %.2f"),
+            "Selecionar": st.column_config.CheckboxColumn()
+        },
+        key="tx_editor"
+    )
+
+    selected_ids = edited.loc[edited["Selecionar"] == True, "id"].astype(int).tolist()
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("Marcar como pago ✅", use_container_width=True, disabled=(len(selected_ids) == 0), key="btn_paid"):
+            with conectar() as con:
+                con.executemany("UPDATE transactions SET status='PAID' WHERE id=?", [(i,) for i in selected_ids])
+                con.commit()
+            st.success("Atualizado para Pago.")
+            st.rerun()
+
+    with c2:
+        if st.button("Marcar como pendente ⏳", use_container_width=True, disabled=(len(selected_ids) == 0), key="btn_pending"):
+            with conectar() as con:
+                con.executemany("UPDATE transactions SET status='PENDING' WHERE id=?", [(i,) for i in selected_ids])
+                con.commit()
+            st.success("Atualizado para Pendente.")
+            st.rerun()
+
+    with c3:
+        if st.button("Excluir selecionados 🗑️", use_container_width=True, disabled=(len(selected_ids) == 0), key="btn_del"):
+            with conectar() as con:
+                con.executemany("DELETE FROM transactions WHERE id=?", [(i,) for i in selected_ids])
+                con.commit()
+            st.success("Excluídos.")
+            st.rerun()
 
 
 # =========================
 # Cartões (cadastro + edição + faturas)
 # =========================
 with tabs[2]:
-    st.subheader("Cartões de crédito")
+    st.subheader("💳 Cartões de crédito")
 
     accounts = carregar_accounts()
     cards = carregar_cards()
@@ -1048,18 +1192,23 @@ with tabs[2]:
         st.info("Cadastre um cartão para ver faturas.")
     else:
         cid = st.selectbox("Cartão", cards["id"].tolist(),
-                           format_func=lambda i: cards.loc[cards["id"] == i, "name"].iloc[0],
+                           format_func=lambda i: map_cards(cards).get(int(i), str(i)),
                            key="stmt_card")
 
         months = sorted(set(tx[(tx["method"] == "CARD") & (tx["card_id"] == cid)]["statement_month"]) - {""})
-        stmt = st.selectbox("Fatura (YYYY-MM)", months, index=len(months) - 1, key="stmt_month") if months else None
+        stmt = st.selectbox("Fatura", months, index=len(months) - 1, format_func=fmt_month_br, key="stmt_month") if months else None
 
         if stmt:
             total = card_statement_total(cid, stmt, tx)
-            st.metric("Total da fatura", f"R$ {total:,.2f}")
+            st.metric("Total da fatura", fmt_currency(total))
 
             detail = card_statement_detail(cid, stmt, tx).sort_values(["dt", "id"])
-            st.dataframe(detail[["dt", "amount", "category", "description", "status", "installment_no", "installments_total"]],
+            det = detail.copy()
+            det["Data"] = det["dt"].apply(fmt_date_br)
+            det["Parcela"] = det.apply(lambda r: fmt_installment(r.get("installment_no"), r.get("installments_total"), r.get("statement_month")), axis=1)
+            det["Valor"] = det["amount"].map(fmt_currency)
+
+            st.dataframe(det[["Data", "Valor", "category", "description", "status", "Parcela"]],
                          use_container_width=True, hide_index=True)
 
             st.divider()
@@ -1072,7 +1221,7 @@ with tabs[2]:
             pay_amount = st.number_input("Valor a pagar", min_value=0.0, value=float(total), step=50.0, key="pay_amount")
 
             if st.button("Registrar pagamento de fatura ✅", use_container_width=True, key="pay_btn"):
-                add_transaction(pay_date, "EXPENSE", pay_amount, "Cartão", f"Pagamento fatura {stmt}", "PAID",
+                add_transaction(pay_date, "EXPENSE", pay_amount, "Cartão", f"Pagamento fatura {fmt_month_br(stmt)}", "PAID",
                                 "CARD_PAYMENT", account_id=pay_acc, card_id=cid, statement_month=stmt)
                 st.success("Pagamento registrado!")
                 st.rerun()
@@ -1087,6 +1236,8 @@ with tabs[3]:
 
     accounts = carregar_accounts()
     cards = carregar_cards()
+    acc_map = map_accounts(accounts)
+    card_map = map_cards(cards)
 
     with st.expander("➕ Criar recorrência"):
         r_name = st.text_input("Nome", placeholder="Ex: Aluguel", key="rec_name")
@@ -1107,12 +1258,12 @@ with tabs[3]:
             opts = accounts[accounts["type"] == ("BANK" if r_method == "BANK" else "CASH")]
             if not opts.empty:
                 r_account_id = st.selectbox("Conta", opts["id"].tolist(),
-                                            format_func=lambda i: opts.loc[opts["id"] == i, "name"].iloc[0],
+                                            format_func=lambda i: acc_map.get(int(i), str(i)),
                                             key="rec_account")
         else:
             if not cards.empty:
                 r_card_id = st.selectbox("Cartão", cards["id"].tolist(),
-                                         format_func=lambda i: cards.loc[cards["id"] == i, "name"].iloc[0],
+                                         format_func=lambda i: card_map.get(int(i), str(i)),
                                          key="rec_card")
 
         if st.button("Salvar recorrência", use_container_width=True, key="rec_save"):
@@ -1139,10 +1290,11 @@ with tabs[3]:
         st.dataframe(rec, use_container_width=True, hide_index=True)
 
     st.divider()
-    target_ym = st.text_input("Gerar recorrências para o mês (YYYY-MM)", value=date.today().strftime("%Y-%m"), key="rec_target_ym")
+    target_ym = st.text_input("Gerar recorrências para o mês", value=date.today().strftime("%Y-%m"), key="rec_target_ym")
+    st.caption("Use o formato YYYY-MM (ex: 2026-01).")
     if st.button("Gerar recorrências do mês ✅", use_container_width=True, key="rec_run_btn"):
         created = run_recurrences_for_month(target_ym)
-        st.success(f"Criados {created} lançamentos recorrentes para {target_ym}.")
+        st.success(f"Criados {created} lançamentos recorrentes para {fmt_month_br(target_ym)}.")
         st.rerun()
 
 
@@ -1164,11 +1316,15 @@ with tabs[4]:
         "Mês (filtro)",
         options=all_months,
         index=all_months.index(hoje.strftime("%Y-%m")) if hoje.strftime("%Y-%m") in all_months else 0,
+        format_func=fmt_month_br,
         key="rep_month"
     )
 
     start, end = month_range(ym)
-    f = tx[(tx["dt"] >= start) & (tx["dt"] <= end) & (tx["status"] == "PAID")].copy()
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end) + pd.Timedelta(days=1)
+
+    f = tx[(tx["dt"] >= start_ts) & (tx["dt"] < end_ts) & (tx["status"] == "PAID")].copy()
 
     f_exp = f[(f["kind"] == "EXPENSE") & (f["method"].isin(["BANK", "CASH", "CARD_PAYMENT"]))].copy()
     group = st.selectbox("Agrupar por", ["Categoria", "Conta", "Cartão"], key="rep_group")
@@ -1179,20 +1335,28 @@ with tabs[4]:
         if group == "Categoria":
             key_series = f_exp["category"].replace("", "Sem categoria")
         elif group == "Conta":
-            mp = {int(r["id"]): r["name"] for _, r in accounts.iterrows()}
+            mp = map_accounts(accounts)
             key_series = f_exp["account_id"].fillna(0).astype(int).map(lambda i: mp.get(i, "—"))
         else:
-            mp = {int(r["id"]): r["name"] for _, r in cards.iterrows()}
+            mp = map_cards(cards)
             key_series = f_exp["card_id"].fillna(0).astype(int).map(lambda i: mp.get(i, "—"))
 
         tab = f_exp.groupby(key_series)["amount"].sum().sort_values(ascending=False)
         st.bar_chart(tab)
-        st.dataframe(tab.reset_index().rename(columns={"index": group, "amount": "Total"}),
-                     use_container_width=True, hide_index=True)
+        df_tab = tab.reset_index()
+        df_tab.columns = [group, "Total"]
+        df_tab["Total"] = df_tab["Total"].map(fmt_currency)
+        st.dataframe(df_tab, use_container_width=True, hide_index=True)
 
     st.divider()
     st.subheader("Detalhamento do mês (pagos)")
-    st.dataframe(f.sort_values(["dt", "id"]), use_container_width=True, hide_index=True)
+    f2 = f.sort_values(["dt", "id"], ascending=[False, False]).copy()
+    f2["Data"] = f2["dt"].apply(fmt_date_br)
+    f2["Status"] = f2["status"].map({"PAID": "Pago", "PENDING": "Pendente"})
+    f2["Meio"] = f2["method"].map({"BANK": "Conta", "CASH": "Dinheiro", "CARD": "Cartão", "CARD_PAYMENT": "Pag. Cartão"})
+    f2["Valor"] = f2["amount"].map(fmt_currency)
+    st.dataframe(f2[["Data", "kind", "Valor", "category", "description", "Status", "Meio", "statement_month"]],
+                 use_container_width=True, hide_index=True)
 
 
 # =========================
@@ -1226,7 +1390,9 @@ with tabs[5]:
     tx = carregar_transactions()
     rows = [{"Conta": a["name"], "Tipo": a["type"], "Saldo": calc_account_balance(int(a["id"]), tx, accounts)}
             for _, a in accounts.iterrows()]
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    df = pd.DataFrame(rows)
+    df["Saldo"] = df["Saldo"].map(fmt_currency)
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 # =========================
@@ -1277,21 +1443,21 @@ with tabs[6]:
         plan = calc_long_goal_plan(goal_row, tx)
 
         st.markdown(f"**Meta ativa:** {goal_row['name']}")
-        st.write(f"Período: **{plan['start_date']}** até **{plan['end_date']}**  |  Meses: **{plan['total_months']}**")
+        st.write(f"Período: **{fmt_date_br(plan['start_date'])}** até **{fmt_date_br(plan['end_date'])}**  |  Meses: **{plan['total_months']}**")
 
         if mobile_mode:
-            st.metric("Valor alvo", f"R$ {plan['target_amount']:,.2f}")
-            st.metric("Valor atual estimado", f"R$ {plan['current_amount']:,.2f}")
-            st.metric("Falta", f"R$ {plan['remaining']:,.2f}")
+            st.metric("Valor alvo", fmt_currency(plan["target_amount"]))
+            st.metric("Valor atual estimado", fmt_currency(plan["current_amount"]))
+            st.metric("Falta", fmt_currency(plan["remaining"]))
         else:
             c1, c2, c3 = st.columns(3)
-            c1.metric("Valor alvo", f"R$ {plan['target_amount']:,.2f}")
-            c2.metric("Valor atual estimado", f"R$ {plan['current_amount']:,.2f}")
-            c3.metric("Falta", f"R$ {plan['remaining']:,.2f}")
+            c1.metric("Valor alvo", fmt_currency(plan["target_amount"]))
+            c2.metric("Valor atual estimado", fmt_currency(plan["current_amount"]))
+            c3.metric("Falta", fmt_currency(plan["remaining"]))
 
         st.progress(plan["progress"])
         st.caption(f"{plan['progress']*100:.1f}% da meta")
-        st.info(f"📌 Para bater a meta, você precisa poupar em média **R$ {plan['need_per_month']:,.2f} / mês** daqui pra frente.")
+        st.info(f"📌 Para bater a meta, você precisa poupar em média **{fmt_currency(plan['need_per_month'])} / mês** daqui pra frente.")
 
     st.divider()
     st.subheader("🏷️ Categorias: Essenciais x Discricionários")
